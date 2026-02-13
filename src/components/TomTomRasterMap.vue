@@ -1,28 +1,44 @@
 <template>
   <div class="wrap">
     <div class="panel">
-      <button @click="toggleBase">ベースON/OFF</button>
-      <button @click="fetchIncidentDetailsBbox">
-        画面範囲の件数(JSON)取得
-      </button>
-      <button @click="openCenterIncidentTile">中心タイル(PNG)を開く</button>
+      <div class="row">
+        <button @click="start" :disabled="running">開始</button>
+        <button @click="stop" :disabled="!running">停止</button>
+        <button @click="flyToBerlin">ベルリンへ</button>
+        <button @click="flyToFukuoka">福岡へ</button>
+      </div>
 
-      <label class="chk">
-        <input type="checkbox" v-model="autoFetchOnMove" />
-        moveendで自動取得
-      </label>
+      <div class="row">
+        <label class="chk">
+          <input type="checkbox" v-model="showBase" @change="applyVisibility" />
+          Base
+        </label>
+        <label class="chk">
+          <input type="checkbox" v-model="showInc" @change="applyVisibility" />
+          Incidents
+        </label>
+        <label class="chk">
+          <input type="checkbox" v-model="showFlow" @change="applyVisibility" />
+          Flow
+        </label>
+      </div>
 
-      <label class="row">
-        incidents style:
-        <select v-model="incidentStyle" @change="reloadIncidentRaster">
-          <option value="s0">s0</option>
-          <option value="day">day</option>
-          <option value="dark">dark</option>
-          <option value="s3">s3</option>
-        </select>
-      </label>
-
-      <span class="hint">ズーム14〜16で確認推奨</span>
+      <div class="log">
+        <div><b>Status:</b> {{ status }}</div>
+        <div><b>Last:</b> {{ last }}</div>
+        <div>
+          <b>Move:</b>
+          {{
+            programmaticMove
+              ? "programmatic"
+              : manualMoving
+                ? "manual"
+                : running
+                  ? "auto"
+                  : "-"
+          }}
+        </div>
+      </div>
     </div>
 
     <div ref="mapEl" class="map"></div>
@@ -36,165 +52,328 @@ import maplibregl from "maplibre-gl";
 const mapEl = ref(null);
 let map = null;
 
-const autoFetchOnMove = ref(true);
-const incidentStyle = ref("s0");
-
 const key = import.meta.env.VITE_TOMTOM_API_KEY;
 
-// IDs
-const BASE_SOURCE_ID = "tomtomBase";
-const BASE_LAYER_ID = "tomtomBaseLayer";
-const INCIDENT_RASTER_SOURCE_ID = "tomtomIncidentsRaster";
-const INCIDENT_RASTER_LAYER_ID = "tomtomIncidentsRasterLayer";
+// UI
+const running = ref(false);
+const status = ref("idle");
+const last = ref("-");
 
-let baseVisible = true;
+// Visibility toggles
+const showBase = ref(true);
+const showInc = ref(true);
+const showFlow = ref(true);
 
-// ---- URL builders ----
+// Sources/Layers
+const BASE_SOURCE = "base";
+const BASE_LAYER = "baseLayer";
+const FLOW_SOURCE = "flow";
+const FLOW_LAYER = "flowLayer";
+const INC_SOURCE = "inc";
+const INC_LAYER = "incLayer";
+
+// Control
+let aborter = null;
+let manualMoveTimer = null;
+let inFlight = false;
+
+const programmaticMove = ref(false);
+
+// ✅ 初期 moveend 連打対策（ロード直後はAPI叩かない）
+let readyAt = 0; // Date.now()
+const INITIAL_SILENCE_MS = 1500;
+
+// ✅ 手動移動判定（ドラッグ/ホイール/タッチ中のみAPI）
+const manualMoving = ref(false);
+let manualFlagTimer = null;
+function markManualMoving() {
+  manualMoving.value = true;
+  if (manualFlagTimer) clearTimeout(manualFlagTimer);
+  manualFlagTimer = setTimeout(() => (manualMoving.value = false), 800);
+}
+
+// ---- Tile URLs ----
 function baseTilesUrl() {
-  // TomTom Map Display raster tiles
   return `https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${encodeURIComponent(
     key,
   )}&tileSize=256&view=Unified`;
 }
-
-function incidentRasterTilesUrl(style) {
-  // TomTom Traffic Incidents raster tiles
-  // t=-1 => latest model
-  return `https://api.tomtom.com/traffic/map/4/tile/incidents/${style}/{z}/{x}/{y}.png?key=${encodeURIComponent(
+function flowTilesUrl() {
+  return `https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${encodeURIComponent(
     key,
-  )}&tileSize=256&t=-1`;
+  )}&tileSize=256`;
+}
+function incidentTilesUrl() {
+  return `https://api.tomtom.com/traffic/map/4/tile/incidents/s1/{z}/{x}/{y}.png?key=${encodeURIComponent(
+    key,
+  )}&tileSize=256`;
 }
 
 // ---- Helpers ----
-function lngLatToTileXY(lng, lat, z) {
-  const n = 2 ** z;
-  const x = Math.floor(((lng + 180) / 360) * n);
-
-  const latRad = (lat * Math.PI) / 180;
-  const y = Math.floor(
-    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n,
-  );
-  return { x, y };
-}
-
-// ---- UI actions ----
-function toggleBase() {
-  if (!map?.getLayer(BASE_LAYER_ID)) return;
-  baseVisible = !baseVisible;
-  map.setLayoutProperty(
-    BASE_LAYER_ID,
-    "visibility",
-    baseVisible ? "visible" : "none",
-  );
-}
-
-function reloadIncidentRaster() {
-  if (!map) return;
-  if (map.getLayer(INCIDENT_RASTER_LAYER_ID))
-    map.removeLayer(INCIDENT_RASTER_LAYER_ID);
-  if (map.getSource(INCIDENT_RASTER_SOURCE_ID))
-    map.removeSource(INCIDENT_RASTER_SOURCE_ID);
-
-  map.addSource(INCIDENT_RASTER_SOURCE_ID, {
-    type: "raster",
-    tiles: [incidentRasterTilesUrl(incidentStyle.value)],
-    tileSize: 256,
-  });
-
-  map.addLayer({
-    id: INCIDENT_RASTER_LAYER_ID,
-    type: "raster",
-    source: INCIDENT_RASTER_SOURCE_ID,
-    paint: { "raster-opacity": 1.0 },
-  });
-}
-
-function openCenterIncidentTile() {
-  if (!map) return;
-
-  const z = Math.round(map.getZoom());
-  const { lng, lat } = map.getCenter();
-  const { x, y } = lngLatToTileXY(lng, lat, z);
-
-  const url =
-    `https://api.tomtom.com/traffic/map/4/tile/incidents/${incidentStyle.value}/${z}/${x}/${y}.png` +
-    `?key=${encodeURIComponent(key)}&tileSize=256&t=-1`;
-
-  window.open(url, "_blank");
-  console.log("center incident tile:", { z, x, y, url });
-}
-
-// ---- JSON fetch (Incident Details) ----
-async function fetchIncidentDetailsBbox() {
-  if (!map) return;
-  if (!key) {
-    console.error("VITE_TOMTOM_API_KEY が未設定です (.env)");
-    return;
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
-
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function nowStr() {
+  return new Date().toLocaleTimeString();
+}
+function metersToLat(m) {
+  return m / 111320;
+}
+function metersToLng(m, lat) {
+  return m / (111320 * Math.cos((lat * Math.PI) / 180));
+}
+function getBboxParamFromMap() {
   const b = map.getBounds();
-  const west = b.getWest();
-  const south = b.getSouth();
-  const east = b.getEast();
-  const north = b.getNorth();
+  return `${b.getWest()},${b.getSouth()},${b.getEast()},${b.getNorth()}`;
+}
+function setLast(msg) {
+  last.value = `${nowStr()} ${msg}`;
+}
 
-  // bbox = lonMin,latMin,lonMax,latMax
-  const bbox = `${west},${south},${east},${north}`;
+// ---- Visibility ----
+function setLayerVisible(layerId, visible) {
+  if (!map || !map.getLayer(layerId)) return;
+  map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
+}
+function applyVisibility() {
+  setLayerVisible(BASE_LAYER, showBase.value);
+  setLayerVisible(INC_LAYER, showInc.value);
+  setLayerVisible(FLOW_LAYER, showFlow.value);
+}
 
-  // なるべく軽く（必要なものだけ）
-  const fields =
-    `{incidents{type,geometry{type,coordinates},properties{` +
-    `id,iconCategory,magnitudeOfDelay,delay,length,` +
-    `events{description,code,iconCategory},startTime,endTime,roadNumbers,timeValidity` +
-    `}}}`;
+// ---- APIs ----
+async function fetchIncidentsInViewport() {
+  const bbox = getBboxParamFromMap();
+  const fields = encodeURIComponent(
+    "{incidents{type,geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,from,to,roadNumbers}}}",
+  );
 
-  // ★重要：language=ja-JP はこのAPIで弾かれるので付けない（400回避）
-  // もし日本語を試すなら language=ja を追加してみる（環境により対応差あり）
   const url =
     `https://api.tomtom.com/traffic/services/5/incidentDetails` +
     `?key=${encodeURIComponent(key)}` +
     `&bbox=${encodeURIComponent(bbox)}` +
-    `&fields=${encodeURIComponent(fields)}` +
+    `&fields=${fields}` +
     `&timeValidityFilter=present`;
 
-  console.log("Incident Details request:", { bbox, url });
+  const res = await fetch(url, { cache: "no-store", signal: aborter?.signal });
+  const text = await res.text();
+  const json = safeJsonParse(text);
+
+  if (!res.ok) {
+    console.warn("incidentDetails error:", res.status, text);
+    return { ok: false, status: res.status };
+  }
+
+  const incidents = json?.incidents ?? json?.incidentDetails?.incidents ?? [];
+  return { ok: true, incidents };
+}
+
+async function fetchFlowSegmentData(lat, lng) {
+  const z = Math.min(22, Math.max(0, Math.round(map.getZoom())));
+  const url =
+    `https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/${z}/json` +
+    `?key=${encodeURIComponent(key)}` +
+    `&point=${encodeURIComponent(`${lat},${lng}`)}` +
+    `&unit=kmph`;
+
+  const res = await fetch(url, { cache: "no-store", signal: aborter?.signal });
+  const text = await res.text();
+  const json = safeJsonParse(text);
+
+  if (!res.ok) {
+    // 400は「道路に当たってない」なので警告のみ
+    console.warn("flowSegmentData error:", res.status, text);
+    return { ok: false, status: res.status, raw: json ?? text };
+  }
+
+  const fsd = json?.flowSegmentData ?? {};
+  const current = Number(fsd.currentSpeed);
+  const free = Number(fsd.freeFlowSpeed);
+  const ratio = free > 0 ? current / free : null;
+  return { ok: true, fsd, ratio, lat, lng };
+}
+
+// ✅ 近傍探索：試行回数を減らし、最大リクエスト数も制限
+async function fetchFlowNear(lat, lng) {
+  const radii = [0, 80, 160, 240, 360, 520]; // 6段階（軽量化）
+  const dirs = [
+    [0, 0],
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+  ];
+
+  const MAX_TRIES = 30; // ✅ ここで上限（初期100連打を防ぐ）
+  let tries = 0;
+
+  for (const r of radii) {
+    for (const [dx, dy] of dirs) {
+      if (++tries > MAX_TRIES) return { ok: false, status: "try_limit" };
+      if (aborter?.signal?.aborted) return { ok: false, status: "aborted" };
+
+      const lat2 = lat + metersToLat(r) * dy;
+      const lng2 = lng + metersToLng(r, lat) * dx;
+
+      const res = await fetchFlowSegmentData(lat2, lng2);
+      if (res.ok) return res;
+
+      // 400は次へ、403などは即返す
+      if (res.status && res.status !== 400) return res;
+    }
+  }
+  return { ok: false, status: 400 };
+}
+
+function isCongested(flow) {
+  const closure = !!flow?.fsd?.roadClosure;
+  const ratio = flow?.ratio;
+  return closure || (ratio != null && ratio < 0.8);
+}
+
+// ---- Moveend handler (manual only) ----
+function onMoveEnd() {
+  if (!map) return;
+
+  // 初期ロード直後は叩かない
+  if (Date.now() - readyAt < INITIAL_SILENCE_MS) return;
+
+  // プログラム移動中は叩かない
+  if (programmaticMove.value) return;
+
+  // 自動運行中は loop 側でチェックするので、ここでは叩かない
+  if (running.value) return;
+
+  // 手動操作っぽい時だけ叩く
+  if (!manualMoving.value) return;
+
+  if (manualMoveTimer) clearTimeout(manualMoveTimer);
+  manualMoveTimer = setTimeout(() => {
+    checkAndMaybeStop("manual");
+  }, 350);
+}
+
+// ---- Detection (single flight) ----
+async function checkAndMaybeStop(label) {
+  if (!map) return false;
+  if (inFlight) return false;
+  inFlight = true;
 
   try {
-    const res = await fetch(url, { cache: "no-store" });
-    const text = await res.text();
+    if (!aborter) aborter = new AbortController();
 
-    if (!res.ok) {
-      console.error("Incident Details HTTP error:", res.status, text);
-      return;
+    const center = map.getCenter();
+
+    if (showInc.value) {
+      status.value = `checking incidents (${label})...`;
+      const inc = await fetchIncidentsInViewport();
+      if (inc.ok && inc.incidents.length > 0) {
+        setLast(`INCIDENT(${label}) count=${inc.incidents.length}`);
+        stop();
+        alert(`事故/規制を検出: ${inc.incidents.length}件`);
+        return true;
+      }
     }
 
-    const json = JSON.parse(text);
-    const incidents = json?.incidents ?? [];
+    if (showFlow.value) {
+      status.value = `checking flow (${label})...`;
+      const flow = await fetchFlowNear(center.lat, center.lng);
 
-    console.log("==== Incident Details result ====");
-    console.log("bbox:", bbox);
-    console.log("incident count:", incidents.length);
-    console.log(
-      "sample(0..2):",
-      incidents.slice(0, 3).map((f) => ({
-        id: f?.properties?.id,
-        iconCategory: f?.properties?.iconCategory,
-        delay: f?.properties?.delay,
-        length: f?.properties?.length,
-        desc: f?.properties?.events?.[0]?.description,
-      })),
-    );
-  } catch (e) {
-    console.error("Incident Details fetch failed:", e);
+      if (flow.ok) {
+        setLast(`FLOW ok ratio=${flow.ratio?.toFixed(2) ?? "-"}`);
+        if (isCongested(flow)) {
+          setLast(
+            `CONGESTION(${label}) ratio=${flow.ratio?.toFixed(2) ?? "-"}`,
+          );
+          stop();
+          alert("渋滞/通行止めを検出");
+          return true;
+        }
+      } else {
+        setLast(`FLOW none/error status=${flow.status ?? "-"}`);
+      }
+    }
+
+    status.value = `no hit (${label})`;
+    return false;
+  } finally {
+    inFlight = false;
   }
 }
 
-// ---- Map init ----
-function onMoveEnd() {
-  if (!autoFetchOnMove.value) return;
-  fetchIncidentDetailsBbox();
+// ---- Auto loop (zoomは変えない) ----
+async function loop() {
+  while (running.value) {
+    const c = map.getCenter();
+
+    // 6km移動（広域） ※centerのみ変更、zoomは触らない
+    const lat = c.lat + metersToLat(6000);
+    const lng = c.lng + metersToLng(6000, c.lat);
+
+    status.value = "moving (auto)...";
+    map.easeTo({ center: [lng, lat], duration: 900 }); // ✅ zoom無し
+    await new Promise((r) => map.once("moveend", r));
+    if (!running.value) break;
+
+    const stopped = await checkAndMaybeStop("auto");
+    if (stopped) break;
+
+    await sleep(400);
+  }
 }
 
+// ---- Buttons ----
+function start() {
+  if (!map || running.value) return;
+  aborter = new AbortController();
+  running.value = true;
+  status.value = "started";
+  setLast("started");
+  loop();
+}
+
+function stop() {
+  running.value = false;
+  status.value = "stopped";
+  try {
+    aborter?.abort();
+  } catch {}
+  aborter = null;
+  inFlight = false;
+}
+
+async function flyToBerlin() {
+  if (!map) return;
+  programmaticMove.value = true;
+  setLast("flyTo Berlin (API paused)");
+  map.flyTo({ center: [13.405, 52.52], speed: 1.2 }); // ✅ zoom無し
+  await new Promise((r) => map.once("moveend", r));
+  programmaticMove.value = false;
+  setLast("arrived Berlin (API resumed)");
+}
+
+async function flyToFukuoka() {
+  if (!map) return;
+  programmaticMove.value = true;
+  setLast("flyTo Fukuoka (API paused)");
+  map.flyTo({ center: [130.4017, 33.5902], speed: 1.2 }); // ✅ zoom無し
+  await new Promise((r) => map.once("moveend", r));
+  programmaticMove.value = false;
+  setLast("arrived Fukuoka (API resumed)");
+}
+
+// ---- Map init ----
 onMounted(() => {
   if (!key) {
     alert("VITE_TOMTOM_API_KEY が未設定です (.env を確認)");
@@ -207,44 +386,75 @@ onMounted(() => {
       version: 8,
       sources: {},
       layers: [
-        // 背景（真っ黒だと“空タイル”と区別しにくいので少し明るい）
         {
           id: "bg",
           type: "background",
-          paint: { "background-color": "#2b2b2b" },
+          paint: { "background-color": "#1d1d1d" },
         },
       ],
     },
-    center: [139.767, 35.681],
-    zoom: 12,
+    center: [139.7595, 35.684],
+    zoom: 11,
   });
 
   map.addControl(new maplibregl.NavigationControl(), "top-right");
 
+  // ✅ 手動操作検知
+  map.on("dragstart", markManualMoving);
+  map.on("zoomstart", markManualMoving);
+  map.on("rotatestart", markManualMoving);
+  map.on("pitchstart", markManualMoving);
+  map.on("wheel", markManualMoving);
+  map.on("touchstart", markManualMoving);
+
   map.on("load", () => {
-    // Base
-    map.addSource(BASE_SOURCE_ID, {
+    map.addSource(BASE_SOURCE, {
       type: "raster",
       tiles: [baseTilesUrl()],
       tileSize: 256,
     });
-    map.addLayer({ id: BASE_LAYER_ID, type: "raster", source: BASE_SOURCE_ID });
+    map.addLayer({ id: BASE_LAYER, type: "raster", source: BASE_SOURCE });
 
-    // Incident raster
-    reloadIncidentRaster();
+    map.addSource(FLOW_SOURCE, {
+      type: "raster",
+      tiles: [flowTilesUrl()],
+      tileSize: 256,
+    });
+    map.addLayer({
+      id: FLOW_LAYER,
+      type: "raster",
+      source: FLOW_SOURCE,
+      paint: { "raster-opacity": 0.9 },
+    });
 
-    // 初回にJSON件数
-    fetchIncidentDetailsBbox();
+    map.addSource(INC_SOURCE, {
+      type: "raster",
+      tiles: [incidentTilesUrl()],
+      tileSize: 256,
+    });
+    map.addLayer({
+      id: INC_LAYER,
+      type: "raster",
+      source: INC_SOURCE,
+      paint: { "raster-opacity": 0.95 },
+    });
 
-    // サイズ変更対策（80vw/80vhなどのとき）
-    requestAnimationFrame(() => map.resize());
-    window.addEventListener("resize", () => map.resize());
+    applyVisibility();
 
+    readyAt = Date.now();
     map.on("moveend", onMoveEnd);
+
+    status.value = "ready";
+    setLast("ready");
   });
 });
 
 onBeforeUnmount(() => {
+  if (manualMoveTimer) clearTimeout(manualMoveTimer);
+  if (manualFlagTimer) clearTimeout(manualFlagTimer);
+  try {
+    aborter?.abort();
+  } catch {}
   if (map) {
     map.off("moveend", onMoveEnd);
     map.remove();
@@ -254,12 +464,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .wrap {
-  width: 80vw;
-  height: 80vh;
+  width: 90vw;
+  height: 85vh;
   position: relative;
   overflow: hidden;
 }
-
 .map {
   width: 100%;
   height: 100%;
@@ -270,29 +479,38 @@ onBeforeUnmount(() => {
   z-index: 10;
   top: 10px;
   left: 10px;
-  background: rgba(255, 255, 255, 0.92);
-  padding: 8px 10px;
-  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  padding: 10px 12px;
+  border-radius: 12px;
   display: flex;
+  flex-direction: column;
   gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.chk {
-  display: inline-flex;
-  gap: 6px;
-  align-items: center;
+  min-width: 560px;
 }
 
 .row {
   display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.chk {
+  display: inline-flex;
   gap: 6px;
   align-items: center;
+  user-select: none;
 }
-
-.hint {
+.log {
   font-size: 12px;
-  opacity: 0.8;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+  padding-top: 8px;
+  line-height: 1.35;
+}
+button {
+  cursor: pointer;
+}
+input[type="checkbox"] {
+  accent-color: #2dd4bf;
 }
 </style>
