@@ -1,26 +1,52 @@
 <template>
   <div class="wrap">
-    <!-- =========================
-         操作用パネル（最小構成）
-         - 都市へ移動（flyTo）
-         - レイヤー表示ON/OFF
-         ========================= -->
+    <!--
+      ============================================
+      操作用パネル（画面左上に重ねる）
+      ============================================
+      - 地図の移動（東京/大阪/福岡）
+      - レイヤー表示切替（Base / Flow / Incidents を raster / vector で切替）
+      - 公式ドキュメントへのリンク
+    -->
     <div class="panel">
       <div class="row">
+        <!--
+          都市ボタン：
+          - map.flyTo() で指定座標へ移動するだけ
+          - flyTo完了後に incidentDetails(API) を1回叩いて console に結果を出す
+            →「その地点でAPIが取れているか」を確認しやすい
+        -->
         <button @click="flyToTokyo">東京</button>
         <button @click="flyToOsaka">大阪</button>
         <button @click="flyToFukuoka">福岡</button>
+
+        <!--
+          TomTom Orbis Maps Traffic API の公式ドキュメント。
+          target="_blank" で別タブ、rel=... はセキュリティ対策（推奨）。
+        -->
+        <a
+          href="https://developer.tomtom.com/traffic-api/documentation/tomtom-orbis-maps/product-information/introduction"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="official-link"
+        >
+          公式サイトへ
+        </a>
       </div>
 
+      <!--
+        レイヤー表示切替：
+        - MapLibre の layer の visibility を visible/none に切り替える
+        - OFFにしても “APIが叩かれない” わけではなく、
+          MapLibreが必要に応じてタイル取得を止めたり再開したりする
+          （表示が消えるので結果として取得量が減ることはある）
+      -->
       <div class="row">
-        <!-- Base: 背景地図（国土地理院タイル） -->
         <label class="chk">
           <input type="checkbox" v-model="showBase" @change="applyVisibility" />
           Base
         </label>
 
-        <!-- Flow: 渋滞（速度/相対速度）レイヤー -->
-        <!-- raster: PNG（サーバ側で描画済みの“絵”） -->
         <label class="chk">
           <input
             type="checkbox"
@@ -30,7 +56,6 @@
           Flow (raster)
         </label>
 
-        <!-- vector: PBF（ラインFeature） -->
         <label class="chk">
           <input
             type="checkbox"
@@ -40,8 +65,6 @@
           Flow (vector)
         </label>
 
-        <!-- Incidents: 事故・規制等 -->
-        <!-- raster: PNG（サーバ側で描画済みの“絵”） -->
         <label class="chk">
           <input
             type="checkbox"
@@ -51,7 +74,6 @@
           Incidents (raster)
         </label>
 
-        <!-- vector: PBF（点/線Feature） -->
         <label class="chk">
           <input
             type="checkbox"
@@ -63,41 +85,68 @@
       </div>
     </div>
 
-    <!-- MapLibre の描画領域 -->
+    <!-- MapLibre の描画領域（ここに地図が表示される） -->
     <div ref="mapEl" class="map"></div>
   </div>
 </template>
 
 <script setup>
+/**
+ * このコンポーネントがやっていること（概要）
+ * ------------------------------------------------------------
+ * 1) MapLibre で地図を表示（styleは背景だけ、タイルは自前で追加）
+ * 2) Base は国土地理院のラスタタイル（std）を表示
+ * 3) Traffic は TomTom Orbis Maps Traffic API のタイルを表示
+ *    - Flow: raster(PNG) / vector(PBF)
+ *    - Incidents: raster(PNG) / vector(PBF)
+ * 4) 追加で incidentDetails(JSON API) を必要に応じて叩き、consoleに出す
+ *
+ * 重要：このコードは “表示確認・調査用” です。
+ * 本番のUI/UXは別途整える想定（ログ量/エラーハンドリング等）。
+ */
+
 import { onMounted, onBeforeUnmount, ref } from "vue";
 import maplibregl from "maplibre-gl";
 
-/**
- * ============================================
- * 設定値（環境変数/固定パラメータ）
- * ============================================
- */
+/* =========================================================
+   1) 設定値（環境変数 / Orbisパラメータ）
+   ========================================================= */
 
-// TomTom API Key（.env の VITE_TOMTOM_API_KEY を参照）
+/**
+ * TomTom API Key
+ * - Vite の環境変数から読み込み（例：.env に VITE_TOMTOM_API_KEY=xxxx）
+ * - これが無いと Orbis のタイルや incidentDetails が 401/403 になりやすい
+ */
 const key = import.meta.env.VITE_TOMTOM_API_KEY;
 
-// Orbis Traffic API のクエリパラメータ（このまま固定でOK）
-const ORBIS_API_VERSION = 1; // apiVersion
-const ORBIS_STYLE = "light"; // rasterタイルの見た目（light/dark等）
-const ORBIS_TILE_SIZE = 256; // tileSize
-const ORBIS_TRAFFIC_MODEL_ID = -1; // t=-1 は “最新” を指定（incidents系で利用）
+/**
+ * TomTom Orbis Maps Traffic API のクエリパラメータ
+ * - apiVersion: APIのバージョン
+ * - style: rasterタイルの見た目（light/dark等）
+ * - tileSize: ラスタタイルのピクセルサイズ（通常256）
+ * - t: trafficModelId（-1は “最新” を意味する）
+ */
+const ORBIS_API_VERSION = 1;
+const ORBIS_STYLE = "light";
+const ORBIS_TILE_SIZE = 256;
+const ORBIS_TRAFFIC_MODEL_ID = -1;
+
+/* =========================================================
+   2) Vue / MapLibre 状態
+   ========================================================= */
 
 /**
- * ============================================
- * Vue / MapLibre 状態
- * ============================================
+ * mapEl:
+ * - template側の <div ref="mapEl"> にアクセスするためのref
+ * map:
+ * - MapLibre の Map インスタンス（onMountedで生成）
  */
 const mapEl = ref(null);
 let map = null;
 
 /**
  * 表示ON/OFF（チェックボックス）
- * - “描画を消す/出す”だけ（APIの取得はMapLibreが必要に応じて行う）
+ * - “どのレイヤーを表示するか” を切り替えるだけのフラグ
  */
 const showBase = ref(true);
 const showFlowRaster = ref(true);
@@ -106,9 +155,9 @@ const showIncRaster = ref(true);
 const showIncVector = ref(false);
 
 /**
- * レイヤー/ソースID
- * - MapLibre 内で一意である必要あり
- * - ここにまとまっていると後から追いやすい
+ * MapLibreの source/layer を識別するためのID
+ * - 文字列は任意だが「一意」である必要がある
+ * - “名前を揃える” と後から読みやすい
  */
 const BASE = "base";
 const FLOW_R = "flowRaster";
@@ -116,72 +165,64 @@ const FLOW_V = "flowVector";
 const INC_R = "incRaster";
 const INC_V = "incVector";
 
-/**
- * ============================================
- * Tile URL（どのデータをどこから取るか）
- * ============================================
- *
- * ※ {z}/{x}/{y} はMapLibreが自動で差し込む（タイル座標）
- * ※ baseだけ国土地理院、交通はTomTom Orbis
- */
-
-// 以前のTomTomベース地図（残しておく：比較用）
-// function baseTiles() {
-//   return `https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${key}&tileSize=256&view=Unified`;
-// }
+/* =========================================================
+   3) タイルURL定義（どこから何を取るか）
+   ========================================================= */
 
 /**
- * Base（背景地図）
+ * Base（背景地図）：
  * - 国土地理院 標準地図（std）
- * - キー不要
- * - 運用時は出典表記など規約に従うこと
+ * - APIキー不要で使える（ただし利用規約・出典表記などは別途対応）
+ * - “道路が細かく見えるベース” として、TomTomのbaseより分かりやすいことが多い
  */
 function baseTiles() {
   return "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
 }
 
 /**
- * Flow（渋滞）Raster（PNG）
- * - “描画済みの画像”が返る（道路が色で塗られている）
+ * Flow raster（PNG）：
+ * - 交通状況が “描画済みの画像” として返る
+ * - 表示が手軽（スタイルはサーバ側で決まる）
  */
 function flowRasterTiles() {
   return `https://api.tomtom.com/maps/orbis/traffic/tile/flow/{z}/{x}/{y}.png?apiVersion=${ORBIS_API_VERSION}&key=${key}&style=${ORBIS_STYLE}&tileSize=${ORBIS_TILE_SIZE}`;
 }
 
 /**
- * Incidents（事故・規制）Raster（PNG）
- * - “描画済みの画像”が返る（アイコン等）
- * - t=-1（最新モデル）を指定
+ * Incidents raster（PNG）：
+ * - 事故/規制などが “描画済みの画像” として返る
+ * - t=-1（最新モデル）を付けて最新に追従させる
  */
 function incRasterTiles() {
   return `https://api.tomtom.com/maps/orbis/traffic/tile/incidents/{z}/{x}/{y}.png?apiVersion=${ORBIS_API_VERSION}&key=${key}&style=${ORBIS_STYLE}&t=${ORBIS_TRAFFIC_MODEL_ID}&tileSize=${ORBIS_TILE_SIZE}`;
 }
 
 /**
- * Flow（渋滞）Vector（PBF）
- * - PBF（Mapbox Vector Tile）形式でFeatureが返る
- * - MapLibre側で自由にスタイル付け可能
+ * Flow vector（PBF）：
+ * - Mapbox Vector Tile(PBF) 形式で “線データ(Feature)” が返る
+ * - MapLibre側で自由に色分け/太さなどを設定できる
  */
 function flowVectorTiles() {
   return `https://api.tomtom.com/maps/orbis/traffic/tile/flow/{z}/{x}/{y}.pbf?apiVersion=${ORBIS_API_VERSION}&key=${key}`;
 }
 
 /**
- * Incidents（事故・規制）Vector（PBF）
- * - 点（ポイント）や線（区間）のFeatureが返る
- * - t=-1（最新モデル）を指定
+ * Incidents vector（PBF）：
+ * - Mapbox Vector Tile(PBF) 形式で “点/線” のFeatureが返る
+ * - t=-1 を付けて最新に追従
  */
 function incVectorTiles() {
   return `https://api.tomtom.com/maps/orbis/traffic/tile/incidents/{z}/{x}/{y}.pbf?apiVersion=${ORBIS_API_VERSION}&key=${key}&t=${ORBIS_TRAFFIC_MODEL_ID}`;
 }
 
+/* =========================================================
+   4) レイヤー表示制御（visibility切替）
+   ========================================================= */
+
 /**
- * ============================================
- * レイヤー表示制御（visibilityの切替）
- * ============================================
- *
- * - レイヤーが存在する場合のみ setLayoutProperty を呼ぶ
- * - visibility = "none" にすると画面から消える
+ * setVisible:
+ * - 指定レイヤーが存在する場合だけ visibility を変更する
+ * - MapLibreは visibility="none" のレイヤーは描画しない
  */
 function setVisible(id, v) {
   if (map.getLayer(id)) {
@@ -190,21 +231,18 @@ function setVisible(id, v) {
 }
 
 /**
- * 画面上のON/OFFをMapLibreのレイヤーに反映
- * ※ログはデバッグ用途（必要なければ消してOK）
+ * applyVisibility:
+ * - チェックボックスの状態をMapLibreレイヤーへ反映
+ * - ここでは “状態をconsoleに出すだけ”
  */
 function applyVisibility() {
-  // Base
   setVisible(BASE, showBase.value);
 
-  // Flow: raster / vector
   setVisible(FLOW_R, showFlowRaster.value);
   setVisible(FLOW_V, showFlowVector.value);
 
-  // Incidents: raster / vector
   setVisible(INC_R, showIncRaster.value);
-
-  // incidents vectorは “線” と “点” を別レイヤーで描画している
+  // incidents vector は線と点が別レイヤーなので2つまとめてON/OFF
   setVisible("incLine", showIncVector.value);
   setVisible("incPoint", showIncVector.value);
 
@@ -217,21 +255,21 @@ function applyVisibility() {
   });
 }
 
+/* =========================================================
+   5) JSON APIを叩いて結果をconsoleへ（incidentDetails）
+   ========================================================= */
+
 /**
- * ============================================
- * API実行結果をログ出力（incidentDetails）
- * ============================================
- *
- * - タイル（raster/vector）はMapLibreが自動取得するため
- *   “自分で叩くAPI”としては incidentDetails を用意
- * - 現在表示範囲（bbox）で incidentDetails を叩き、レスポンスをconsoleに出す
+ * logIncidentDetails:
+ * - 現在表示している範囲（bbox）で incidentDetails を1回叩く
+ * - 目的：タイル描画だけでなく、JSONでも “どれだけ事故があるか” を確認したい
  */
 async function logIncidentDetails() {
-  // 画面表示範囲（西南東北）を bbox として組み立て
+  // bbox は (west,south,east,north) の順
   const b = map.getBounds();
   const bbox = `${b.getWest()},${b.getSouth()},${b.getEast()},${b.getNorth()}`;
 
-  // incidentDetails（JSON）
+  // incidentDetails（Orbis）
   const url =
     `https://api.tomtom.com/maps/orbis/traffic/incidentDetails` +
     `?apiVersion=${ORBIS_API_VERSION}` +
@@ -240,43 +278,45 @@ async function logIncidentDetails() {
     `&timeValidityFilter=present` +
     `&t=${ORBIS_TRAFFIC_MODEL_ID}`;
 
-  // 実行時間を測っておく（ネットワーク状況の把握に便利）
+  // ネットワーク時間を計測してログに出す（遅延調査に便利）
   const t0 = performance.now();
   const res = await fetch(url);
   const txt = await res.text();
   const ms = Math.round(performance.now() - t0);
 
   console.log("incidentDetails", {
-    request: { url, bbox },
+    request: { bbox, url },
     response: { status: res.status, timeMs: ms, body: txt },
   });
 }
 
+/* =========================================================
+   6) 都市移動（flyTo）
+   ========================================================= */
+
 /**
- * ============================================
- * FlyTo（都市へジャンプ）
- * ============================================
- *
- * - flyTo後、moveendを待ってから incidentDetails を1回ログ出力する
- * - 目的：移動先で“APIが取れているか”を確実に確認する
+ * flyTo:
+ * - 指定した中心座標へ移動し、移動完了(moveend)後に incidentDetails をログ出す
+ * - 目的：手動で地図を動かさなくても、代表地点でAPIが取れるか確認できる
  */
 async function flyTo(center, label) {
   console.log("flyTo:", label);
 
-  // speed は移動アニメーション速度（数値が大きいほど速い）
+  // speedはアニメ速度。zoomは指定していないので現在のズームを維持する。
   map.flyTo({ center, speed: 1.2 });
 
-  // flyToの完了（moveend）を待つ
+  // flyTo完了（moveend）を待つ
   await new Promise((r) => map.once("moveend", r));
 
   console.log("arrived:", label);
 
-  // 移動後の表示範囲でAPI結果をログ出し
+  // 到着後のbboxでAPI確認
   await logIncidentDetails();
 }
 
 /**
- * 都市ボタン用（座標は駅付近）
+ * 都市ボタン（駅付近の座標）
+ * - 必要なら微調整してOK
  */
 function flyToTokyo() {
   flyTo([139.767125, 35.681236], "Tokyo");
@@ -288,19 +328,18 @@ function flyToFukuoka() {
   flyTo([130.4201, 33.5903], "Fukuoka");
 }
 
-/**
- * ============================================
- * 初期化（MapLibreの起動＆レイヤー登録）
- * ============================================
- */
+/* =========================================================
+   7) MapLibre 初期化（onMounted / onBeforeUnmount）
+   ========================================================= */
+
 onMounted(() => {
-  // APIキー未設定のときはここで気づけるように（画面に出したいならalertでもOK）
+  // APIキー未設定は事故りやすいので警告（UI表示は不要なのでconsoleのみ）
   if (!key) {
-    console.warn("VITE_TOMTOM_API_KEY が未設定です (.env を確認)");
+    console.warn("VITE_TOMTOM_API_KEY が未設定です（.env を確認）");
   }
 
-  // MapLibre Map 初期化
-  // style は最小構成（背景色のみ）にして、タイルは自前で追加
+  // MapLibre Map生成
+  // - style は背景だけ（sources/layersは load 後に addSource/addLayer する）
   map = new maplibregl.Map({
     container: mapEl.value,
     style: {
@@ -314,113 +353,125 @@ onMounted(() => {
         },
       ],
     },
-    center: [139.767125, 35.681236], // 初期は東京
+    center: [139.767125, 35.681236], // 初期位置：東京
     zoom: 11,
   });
 
-  // 読み込み完了後にソース/レイヤーを追加
+  /**
+   * map.on("load"):
+   * - MapLibreの初期ロード完了後に
+   *   “タイルソース” と “レイヤー” を登録する
+   */
   map.on("load", () => {
-    /**
-     * -------------------------
-     * Base（国土地理院）
-     * -------------------------
-     */
+    // -------------------------
+    // Base（国土地理院・ラスタ）
+    // -------------------------
     map.addSource(BASE, {
       type: "raster",
       tiles: [baseTiles()],
       tileSize: 256,
     });
-    map.addLayer({ id: BASE, type: "raster", source: BASE });
+    map.addLayer({
+      id: BASE,
+      type: "raster",
+      source: BASE,
+    });
 
-    /**
-     * -------------------------
-     * Flow raster（PNG）
-     * -------------------------
-     */
+    // -------------------------
+    // Flow raster（PNG）
+    // -------------------------
     map.addSource(FLOW_R, {
       type: "raster",
       tiles: [flowRasterTiles()],
       tileSize: 256,
     });
-    map.addLayer({ id: FLOW_R, type: "raster", source: FLOW_R });
+    map.addLayer({
+      id: FLOW_R,
+      type: "raster",
+      source: FLOW_R,
+    });
 
-    /**
-     * -------------------------
-     * Incidents raster（PNG）
-     * -------------------------
-     */
+    // -------------------------
+    // Incidents raster（PNG）
+    // -------------------------
     map.addSource(INC_R, {
       type: "raster",
       tiles: [incRasterTiles()],
       tileSize: 256,
     });
-    map.addLayer({ id: INC_R, type: "raster", source: INC_R });
+    map.addLayer({
+      id: INC_R,
+      type: "raster",
+      source: INC_R,
+    });
 
-    /**
-     * -------------------------
-     * Flow vector（PBF）
-     * -------------------------
-     *
-     * "source-layer" は PBF内のレイヤー名
-     * 表示が出ない場合は、ここが合ってない可能性がある
-     */
+    // -------------------------
+    // Flow vector（PBF）
+    // -------------------------
     map.addSource(FLOW_V, {
       type: "vector",
       tiles: [flowVectorTiles()],
     });
+
+    /**
+     * 注意：
+     * - "source-layer" は PBFの中のレイヤー名
+     * - 表示されない場合、ここが一致していない可能性が高い
+     */
     map.addLayer({
       id: FLOW_V,
       type: "line",
       source: FLOW_V,
       "source-layer": "Traffic flow",
       paint: {
-        // ひとまず固定色（要件は“表示できること”）
+        // ここは最低限の固定スタイル（表示確認用）
         "line-color": "#00ff88",
         "line-width": 3,
       },
     });
 
-    /**
-     * -------------------------
-     * Incidents vector（PBF）
-     * -------------------------
-     *
-     * incidentsは線/点が別レイヤーで入っているため、
-     * MapLibre側でも別レイヤーとして描画している
-     */
+    // -------------------------
+    // Incidents vector（PBF）
+    // -------------------------
     map.addSource(INC_V, {
       type: "vector",
       tiles: [incVectorTiles()],
     });
 
-    // 区間（line）
+    // Incidents: 線（規制区間など）
     map.addLayer({
       id: "incLine",
       type: "line",
       source: INC_V,
       "source-layer": "Traffic incident flow",
-      paint: { "line-color": "#ff6600", "line-width": 4 },
+      paint: {
+        "line-color": "#ff6600",
+        "line-width": 4,
+      },
     });
 
-    // 点（point）
+    // Incidents: 点（事故アイコン等）
     map.addLayer({
       id: "incPoint",
       type: "circle",
       source: INC_V,
       "source-layer": "Traffic incident points",
-      paint: { "circle-radius": 5, "circle-color": "#ff6600" },
+      paint: {
+        "circle-radius": 5,
+        "circle-color": "#ff6600",
+      },
     });
 
-    // 初期の表示ON/OFF反映
+    // 初期状態のON/OFF反映
     applyVisibility();
 
-    // 起動確認ログ（必要なければ消してOK）
     console.log("map ready");
   });
 
   /**
-   * MapLibre内部のロードエラー（タイル取得失敗など）
-   * - 401/403/CORSなどの調査に役立つ
+   * map.on("error"):
+   * - タイル取得失敗（401/403/CORS/ネットワーク等）のログ確認に使える
+   * - MapLibre内部エラーはここに来ることがある
    */
   map.on("error", (e) => {
     console.log("map error:", e.error);
@@ -428,7 +479,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  // コンポーネント破棄時にMapを破棄（メモリリーク防止）
+  // Mapインスタンスを破棄（メモリリーク防止）
   if (map) map.remove();
 });
 </script>
@@ -439,12 +490,14 @@ onBeforeUnmount(() => {
   height: 85vh;
   position: relative;
 }
+
+/* 地図表示領域（全面） */
 .map {
   width: 100%;
   height: 100%;
 }
 
-/* 操作用パネル */
+/* パネルは地図の上に重ねる */
 .panel {
   position: absolute;
   z-index: 10;
@@ -466,5 +519,15 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 6px;
   align-items: center;
+}
+
+/* 公式リンク（見た目だけ） */
+.official-link {
+  color: #4ade80;
+  text-decoration: none;
+  font-weight: bold;
+}
+.official-link:hover {
+  text-decoration: underline;
 }
 </style>
