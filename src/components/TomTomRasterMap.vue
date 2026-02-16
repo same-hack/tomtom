@@ -24,6 +24,9 @@
       </div>
 
       <div class="log">
+        <div>
+          <b>Mode:</b> {{ USE_ORBIS_TRAFFIC ? "Orbis" : "TomTom Maps" }}
+        </div>
         <div><b>Status:</b> {{ status }}</div>
         <div><b>Last:</b> {{ last }}</div>
         <div>
@@ -38,6 +41,10 @@
                   : "-"
           }}
         </div>
+        <div v-if="USE_ORBIS_TRAFFIC && showFlow" class="hint">
+          ※ Orbisモードでは
+          FlowSegmentData（数値）を使わず、Flowはタイル表示のみです
+        </div>
       </div>
     </div>
 
@@ -48,6 +55,23 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref } from "vue";
 import maplibregl from "maplibre-gl";
+
+/**
+ * =========================
+ *  Orbis切り替えスイッチ
+ * =========================
+ *
+ * true  : TomTom Orbis Traffic API（日本でタイルが出る想定）
+ * false : 従来の /traffic/services/* /traffic/map/* を使う
+ */
+const USE_ORBIS_TRAFFIC = true;
+
+// Orbis params
+const ORBIS_API_VERSION = 1;
+const ORBIS_STYLE = "light"; // "dark" も可（好み）
+const ORBIS_TILE_SIZE = 256;
+// trafficModelId: -1 は “最新” を指す（incidents tile / incidentDetails で使用）
+const ORBIS_TRAFFIC_MODEL_ID = -1;
 
 const mapEl = ref(null);
 let map = null;
@@ -94,16 +118,42 @@ function markManualMoving() {
 
 // ---- Tile URLs ----
 function baseTilesUrl() {
+  // ベース地図は従来のTomTom MapsでOK（表示の安定性が高い）
   return `https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${encodeURIComponent(
     key,
   )}&tileSize=256&view=Unified`;
 }
+
 function flowTilesUrl() {
+  if (USE_ORBIS_TRAFFIC) {
+    // Orbis Flow Raster Tiles
+    return (
+      `https://api.tomtom.com/maps/orbis/traffic/tile/flow/{z}/{x}/{y}.png` +
+      `?apiVersion=${ORBIS_API_VERSION}` +
+      `&key=${encodeURIComponent(key)}` +
+      `&style=${encodeURIComponent(ORBIS_STYLE)}` +
+      `&tileSize=${ORBIS_TILE_SIZE}`
+    );
+  }
+  // 従来（TomTom Maps Traffic）
   return `https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${encodeURIComponent(
     key,
   )}&tileSize=256`;
 }
+
 function incidentTilesUrl() {
+  if (USE_ORBIS_TRAFFIC) {
+    // Orbis Incidents Raster Tiles
+    return (
+      `https://api.tomtom.com/maps/orbis/traffic/tile/incidents/{z}/{x}/{y}.png` +
+      `?apiVersion=${ORBIS_API_VERSION}` +
+      `&key=${encodeURIComponent(key)}` +
+      `&style=${encodeURIComponent(ORBIS_STYLE)}` +
+      `&t=${encodeURIComponent(String(ORBIS_TRAFFIC_MODEL_ID))}` +
+      `&tileSize=${ORBIS_TILE_SIZE}`
+    );
+  }
+  // 従来（TomTom Maps Traffic）
   return `https://api.tomtom.com/traffic/map/4/tile/incidents/s1/{z}/{x}/{y}.png?key=${encodeURIComponent(
     key,
   )}&tileSize=256`;
@@ -151,16 +201,27 @@ function applyVisibility() {
 // ---- APIs ----
 async function fetchIncidentsInViewport() {
   const bbox = getBboxParamFromMap();
+
+  // fields は Orbis / 従来 どちらも “fields” パラメータで絞る用途として維持
   const fields = encodeURIComponent(
     "{incidents{type,geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,from,to,roadNumbers}}}",
   );
 
-  const url =
-    `https://api.tomtom.com/traffic/services/5/incidentDetails` +
-    `?key=${encodeURIComponent(key)}` +
-    `&bbox=${encodeURIComponent(bbox)}` +
-    `&fields=${fields}` +
-    `&timeValidityFilter=present`;
+  const url = USE_ORBIS_TRAFFIC
+    ? // ✅ Orbis Incident Details
+      `https://api.tomtom.com/maps/orbis/traffic/incidentDetails` +
+      `?apiVersion=${ORBIS_API_VERSION}` +
+      `&key=${encodeURIComponent(key)}` +
+      `&bbox=${encodeURIComponent(bbox)}` +
+      `&fields=${fields}` +
+      `&timeValidityFilter=present` +
+      `&t=${encodeURIComponent(String(ORBIS_TRAFFIC_MODEL_ID))}`
+    : // 従来（TomTom Maps Traffic）
+      `https://api.tomtom.com/traffic/services/5/incidentDetails` +
+      `?key=${encodeURIComponent(key)}` +
+      `&bbox=${encodeURIComponent(bbox)}` +
+      `&fields=${fields}` +
+      `&timeValidityFilter=present`;
 
   const res = await fetch(url, { cache: "no-store", signal: aborter?.signal });
   const text = await res.text();
@@ -168,14 +229,35 @@ async function fetchIncidentsInViewport() {
 
   if (!res.ok) {
     console.warn("incidentDetails error:", res.status, text);
-    return { ok: false, status: res.status };
+    return { ok: false, status: res.status, raw: json ?? text };
   }
 
+  // Orbis: { incidents: [...] } / 従来: { incidents: [...] } or { incidentDetails: { incidents } }
   const incidents = json?.incidents ?? json?.incidentDetails?.incidents ?? [];
   return { ok: true, incidents };
 }
 
+/**
+ * =========================
+ * Flow（数値）の扱い
+ * =========================
+ *
+ * - TomTom Maps の flowSegmentData は、日本で常時400になる実測が出ている
+ * - Orbisは “Flowはタイル中心” のため、ここでは数値APIを使わず「表示のみ」にする
+ *
+ * どうしても数値が必要なら：
+ * - TomTomの別プロダクト（Intermediate Traffic / Flow Detailed 等）をバックエンド経由で使う構成にするのが現実的
+ */
 async function fetchFlowSegmentData(lat, lng) {
+  if (USE_ORBIS_TRAFFIC) {
+    return {
+      ok: false,
+      status: "orbis_tiles_only",
+      raw: "Orbis mode uses flow tiles only (no flowSegmentData).",
+    };
+  }
+
+  // 従来（TomTom Maps Traffic）: ただし日本では400が続く可能性が高い
   const z = Math.min(22, Math.max(0, Math.round(map.getZoom())));
   const url =
     `https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/${z}/json` +
@@ -188,7 +270,6 @@ async function fetchFlowSegmentData(lat, lng) {
   const json = safeJsonParse(text);
 
   if (!res.ok) {
-    // 400は「道路に当たってない」なので警告のみ
     console.warn("flowSegmentData error:", res.status, text);
     return { ok: false, status: res.status, raw: json ?? text };
   }
@@ -202,6 +283,9 @@ async function fetchFlowSegmentData(lat, lng) {
 
 // ✅ 近傍探索：試行回数を減らし、最大リクエスト数も制限
 async function fetchFlowNear(lat, lng) {
+  // Orbisモードは数値を取らない
+  if (USE_ORBIS_TRAFFIC) return { ok: false, status: "orbis_tiles_only" };
+
   const radii = [0, 80, 160, 240, 360, 520]; // 6段階（軽量化）
   const dirs = [
     [0, 0],
@@ -215,7 +299,7 @@ async function fetchFlowNear(lat, lng) {
     [-1, -1],
   ];
 
-  const MAX_TRIES = 30; // ✅ ここで上限（初期100連打を防ぐ）
+  const MAX_TRIES = 30;
   let tries = 0;
 
   for (const r of radii) {
@@ -224,7 +308,8 @@ async function fetchFlowNear(lat, lng) {
       if (aborter?.signal?.aborted) return { ok: false, status: "aborted" };
 
       const lat2 = lat + metersToLat(r) * dy;
-      const lng2 = lng + metersToLng(r, lat) * dx;
+      // ✅ lat2 を使って経度換算（地味にズレるのを防止）
+      const lng2 = lng + metersToLng(r, lat2) * dx;
 
       const res = await fetchFlowSegmentData(lat2, lng2);
       if (res.ok) return res;
@@ -275,33 +360,46 @@ async function checkAndMaybeStop(label) {
 
     const center = map.getCenter();
 
+    // Incidents
     if (showInc.value) {
       status.value = `checking incidents (${label})...`;
       const inc = await fetchIncidentsInViewport();
+
       if (inc.ok && inc.incidents.length > 0) {
         setLast(`INCIDENT(${label}) count=${inc.incidents.length}`);
         stop();
         alert(`事故/規制を検出: ${inc.incidents.length}件`);
         return true;
       }
+
+      if (!inc.ok) {
+        setLast(`INC none/error status=${inc.status ?? "-"}`);
+      }
     }
 
+    // Flow
     if (showFlow.value) {
-      status.value = `checking flow (${label})...`;
-      const flow = await fetchFlowNear(center.lat, center.lng);
-
-      if (flow.ok) {
-        setLast(`FLOW ok ratio=${flow.ratio?.toFixed(2) ?? "-"}`);
-        if (isCongested(flow)) {
-          setLast(
-            `CONGESTION(${label}) ratio=${flow.ratio?.toFixed(2) ?? "-"}`,
-          );
-          stop();
-          alert("渋滞/通行止めを検出");
-          return true;
-        }
+      if (USE_ORBIS_TRAFFIC) {
+        // Orbis: Flowはタイル表示のみ（数値チェックはしない）
+        status.value = `flow visible (tiles only) (${label})...`;
+        setLast(`FLOW(${label}) tiles-only (no numeric check)`);
       } else {
-        setLast(`FLOW none/error status=${flow.status ?? "-"}`);
+        status.value = `checking flow (${label})...`;
+        const flow = await fetchFlowNear(center.lat, center.lng);
+
+        if (flow.ok) {
+          setLast(`FLOW ok ratio=${flow.ratio?.toFixed(2) ?? "-"}`);
+          if (isCongested(flow)) {
+            setLast(
+              `CONGESTION(${label}) ratio=${flow.ratio?.toFixed(2) ?? "-"}`,
+            );
+            stop();
+            alert("渋滞/通行止めを検出");
+            return true;
+          }
+        } else {
+          setLast(`FLOW none/error status=${flow.status ?? "-"}`);
+        }
       }
     }
 
@@ -393,7 +491,7 @@ onMounted(() => {
         },
       ],
     },
-    center: [139.7595, 35.684],
+    center: [139.7595, 35.684], // Tokyo
     zoom: 11,
   });
 
@@ -506,6 +604,10 @@ onBeforeUnmount(() => {
   border-top: 1px solid rgba(255, 255, 255, 0.2);
   padding-top: 8px;
   line-height: 1.35;
+}
+.hint {
+  opacity: 0.85;
+  font-size: 11px;
 }
 button {
   cursor: pointer;
